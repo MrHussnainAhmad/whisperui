@@ -1,0 +1,90 @@
+# Node / package managers
+node_modules/
+.pnp/
+.pnp.js
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Expo
+.expo/
+.expo-shared/
+.eas/
+web-build/
+dist/
+
+# React Native
+*.jks
+*.keystore
+*.p8
+*.p12
+*.key
+*.pem
+*.cer
+*.cert
+*.mobileprovision
+
+# iOS
+ios/Pods/
+ios/build/
+ios/DerivedData/
+*.xcworkspace
+*.xcuserstate
+*.xcuserdatad
+*.xcuserdata/
+*.ipa
+
+# Android
+android/.gradle/
+android/.cxx/
+cxx/
+android/app/build/
+android/build/
+android/local.properties
+android/key.properties
+android/app/key.properties
+*.apk
+*.aab
+*.ap_
+android/app/src/main/assets/index.android.bundle
+*.hprof
+
+# Metro / bundler
+.metro-health-check*
+
+# Env files (keep .env.example committed)
+.env*
+!.env.example
+!.env.*.example
+
+# Local credentials and third-party service configs
+credentials.json
+credential*.json
+service-account*.json
+google-services.json
+GoogleService-Info.plist
+firebase-debug.log
+sentry.properties
+local.properties
+expo-env.d.ts
+
+# Coverage / logs
+coverage/
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.iml
+
+# Build output
+build/
+.codex-*/
+.npm-cache/
+
+# Generate native projects from app config and privacy plugins during EAS builds.
+/android/
+/ios/

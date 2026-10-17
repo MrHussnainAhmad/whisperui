@@ -1,5 +1,7 @@
 package com.hussnainahmadsahi.chat
 
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
 
@@ -16,7 +18,21 @@ class MainActivity : ReactActivity() {
     // coloring the background, status bar, and navigation bar.
     // This is required for expo-splash-screen.
     setTheme(R.style.AppTheme);
+    // Keep the tablet UI in landscape while phones remain unrestricted.
+    if (isTablet()) requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+    // Whisper native window privacy
+    window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+    if (android.os.Build.VERSION.SDK_INT >= 31) window.setHideOverlayWindows(true)
+    if (android.os.Build.VERSION.SDK_INT >= 29) {
+      (getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager)
+        .setAllowedCapturePolicy(android.media.AudioAttributes.ALLOW_CAPTURE_BY_NONE)
+    }
     super.onCreate(null)
+  }
+
+  private fun isTablet(): Boolean {
+    val size = resources.configuration.screenLayout and Configuration.SCREENLAYOUT_SIZE_MASK
+    return size >= Configuration.SCREENLAYOUT_SIZE_LARGE
   }
 
   /**
@@ -57,5 +73,24 @@ class MainActivity : ReactActivity() {
       // Use the default back button implementation on Android S
       // because it's doing more than [Activity.moveTaskToBack] in fact.
       super.invokeDefaultOnBackPressed()
+  }
+
+  // Discard obscured input; report evidence rather than scanning installed apps.
+  private var lastPrivacyEventAt = 0L
+  override fun dispatchTouchEvent(event: android.view.MotionEvent): Boolean {
+    val obscured = (event.flags and android.view.MotionEvent.FLAG_WINDOW_IS_OBSCURED) != 0 ||
+      (android.os.Build.VERSION.SDK_INT >= 29 &&
+        (event.flags and android.view.MotionEvent.FLAG_WINDOW_IS_PARTIALLY_OBSCURED) != 0)
+    if (obscured) {
+      val now = android.os.SystemClock.elapsedRealtime()
+      if (now - lastPrivacyEventAt > 1000L) {
+        lastPrivacyEventAt = now
+        val context = (application as com.facebook.react.ReactApplication).reactHost?.currentReactContext
+        context?.getJSModule(com.facebook.react.modules.core.DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+          ?.emit("WhisperPrivacyViolation", "overlay")
+      }
+      return true
+    }
+    return super.dispatchTouchEvent(event)
   }
 }

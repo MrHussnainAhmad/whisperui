@@ -11,74 +11,202 @@ import {
   destroy as destroyE2E,
   isReady,
   setInviteBinding,
+  setRoomBinding,
 } from './e2e';
+import { File } from 'expo-file-system';
+import { isOwnedAttachment, encodeChunk } from './attachmentFiles';
 import { getServerUrl } from '../config';
+import { ensureCaptureProtection } from './captureProtection';
+import { isValidBase64, base64ByteLength } from './payloadValidation';
+import { CHUNK_BYTES, CHUNK_CHARS, acceptMediaChunk, clearMediaTransfers } from './mediaTransfer';
+import {
+  MAX_RECONNECT_ATTEMPTS,
+  RECONNECT_WINDOW_MS,
+  INITIAL_CONNECTION_TIMEOUT_MS,
+  CONNECTION_ATTEMPT_TIMEOUT_MS,
+  shouldStopReconnect,
+} from './reconnectPolicy';
+
+export { MAX_RECONNECT_ATTEMPTS, RECONNECT_WINDOW_MS } from './reconnectPolicy';
 
 const MAX_RECEIVED_ENCRYPTED_CHARS = 5_592_408;
-const MAX_MEDIA_BASE64_CHARS = 4_000_000;
-const MAX_MEDIA_BYTES = 3_000_000;
+const MAX_INLINE_MEDIA_BASE64_CHARS = 4_000_000;
+const MAX_INLINE_MEDIA_BYTES = 3_000_000;
 const INVITE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
-const FULL_INVITE_RE = /^TALK-[2-9A-HJ-NP-Z]{4}(?:-[2-9A-HJ-NP-Z]{4}){7}$/;
-const BARE_INVITE_RE = /^[2-9A-HJ-NP-Z]{4}(?:-[2-9A-HJ-NP-Z]{4}){7}$/;
-const INVITE_IN_TEXT_RE = /(?:TALK-)?[2-9A-HJ-NP-Z]{4}(?:-[2-9A-HJ-NP-Z]{4}){7}/;
+const FULL_INVITE_RE = /^TALK-[2-9A-HJ-NP-Z]{4}(?:-[2-9A-HJ-NP-Z]{4}){16}$/;
+const BARE_INVITE_RE = /^[2-9A-HJ-NP-Z]{4}(?:-[2-9A-HJ-NP-Z]{4}){16}$/;
+const INVITE_IN_TEXT_RE = /(?:TALK-)?[2-9A-HJ-NP-Z]{4}(?:-[2-9A-HJ-NP-Z]{4}){16}(?![2-9A-HJ-NP-Z-])/;
+const MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/heic', 'image/heif']);
 const VIDEO_MIME_TYPES = new Set(['video/mp4', 'video/quicktime', 'video/webm', 'video/x-m4v', 'video/3gpp']);
 const SAFE_MIME_RE = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,49}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,49}$/;
 
 let socket = null;
 let connectPromise = null;
+let reconnectDeadlineTimer = null;
 let keyGenPromise = null;
 let chatVerified = false;
 let sendSequence = 0;
 let receiveSequence = 0;
+const receivedSequences = new Set();
+let sessionEpoch = 0;
+let activeRoomId = null;
+let allowSavingMyMedia = false;
+let queuedCharacters = 0;
+let queuedMessages = 0;
+let pendingInviteRequest = null;
+const pendingRequests = new Set();
+const chunkWaiters = new Map();
+const activeMediaSends = new Set();
 
-export function configureChatSecurity({ inviteCode, chatMode } = {}) {
+export function getChatEpoch() { return sessionEpoch; }
+export function isChatEpochActive(epoch) {
+  return epoch === sessionEpoch && activeRoomId !== null;
+}
+
+export function configureChatSecurity({ inviteCode, chatMode, roomId } = {}) {
+  resetE2E();
+  if (socket?.data) socket.data.pendingMatch = null;
+  activeRoomId = typeof roomId === 'string' ? roomId : null;
   setInviteBinding(chatMode === 'invite' && inviteCode ? inviteCode : null);
+  setRoomBinding(roomId);
   chatVerified = false;
   sendSequence = 0;
   receiveSequence = 0;
 }
 
+function clearReconnectDeadline() {
+  if (!reconnectDeadlineTimer) return;
+  clearTimeout(reconnectDeadlineTimer);
+  reconnectDeadlineTimer = null;
+}
+
+function stopAutomaticReconnect(target) {
+  clearReconnectDeadline();
+  target.io.reconnection(false);
+  if (!target.connected) target.disconnect();
+}
+
+function attachReconnectPolicy(target) {
+  target.on('matched', (match) => {
+    // Preserve a match that arrives while Home is handing off to Waiting.
+    target.data = { ...(target.data || {}), pendingMatch: match };
+  });
+  target.on('joined', () => {
+    target.data = {
+      ...(target.data || {}),
+      sessionReady: true,
+      reconnectStartedAt: null,
+    };
+    clearReconnectDeadline();
+  });
+
+  target.on('disconnect', (reason) => {
+    const wasInChat = activeRoomId !== null;
+    resetE2E();
+    target.data = { ...(target.data || {}), sessionReady: false, pendingMatch: null };
+    if (wasInChat || reason === 'io client disconnect' || reason === 'io server disconnect') {
+      stopAutomaticReconnect(target);
+      return;
+    }
+
+    const reconnectStartedAt = Date.now();
+    target.data = { ...(target.data || {}), reconnectStartedAt };
+    target.io.reconnection(true);
+    clearReconnectDeadline();
+    reconnectDeadlineTimer = setTimeout(() => {
+      if (socket === target && !target.data?.sessionReady) stopAutomaticReconnect(target);
+    }, RECONNECT_WINDOW_MS);
+  });
+
+  target.io.on('reconnect_attempt', (attempt) => {
+    const startedAt = target.data?.reconnectStartedAt;
+    const elapsedMs = Number.isFinite(startedAt) ? Date.now() - startedAt : 0;
+    if (shouldStopReconnect(attempt, elapsedMs)) {
+      stopAutomaticReconnect(target);
+    }
+  });
+
+  target.io.on('reconnect_failed', () => clearReconnectDeadline());
+}
+
+function waitForSession(target, timeoutMs) {
+  connectPromise = new Promise((resolve, reject) => {
+    let settled = false;
+    let lastError = null;
+    const cleanup = () => {
+      clearTimeout(timer);
+      target.off('joined', ready);
+      target.off('connect_error', rememberError);
+      target.io.off('reconnect_failed', failed);
+    };
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      connectPromise = null;
+      callback(value);
+    };
+    const ready = () => finish(resolve, target);
+    const rememberError = (error) => { lastError = error; };
+    const failed = () => finish(reject, lastError || new Error('Could not connect'));
+    const timer = setTimeout(() => {
+      stopAutomaticReconnect(target);
+      finish(reject, lastError || new Error('Connection timed out'));
+    }, timeoutMs);
+
+    target.once('joined', ready);
+    target.on('connect_error', rememberError);
+    target.io.once('reconnect_failed', failed);
+  });
+  return connectPromise;
+}
+
 export function connectSocket() {
+  if (socket?.data?.localClosing) socket.disconnect();
   if (socket?.connected && socket.data?.sessionReady) return Promise.resolve(socket);
   if (connectPromise) return connectPromise;
 
-  connectPromise = new Promise((resolve, reject) => {
-    const serverUrl = getServerUrl();
-    socket = io(serverUrl, {
-      // Prefer websocket; allow polling fallback in dev (some Android/LAN paths block WS-only).
-      transports: __DEV__ ? ['websocket', 'polling'] : ['websocket'],
-      reconnection: false,
-      timeout: 10000,
-    });
-    socket.data = { ...(socket.data || {}), serverUrl };
+  if (socket?.active) {
+    const startedAt = socket.data?.reconnectStartedAt;
+    const remaining = Number.isFinite(startedAt)
+      ? Math.max(1, RECONNECT_WINDOW_MS - (Date.now() - startedAt))
+      : RECONNECT_WINDOW_MS;
+    return waitForSession(socket, remaining);
+  }
 
-    let settled = false;
-    const fail = (err) => {
-      if (settled) return;
-      settled = true;
-      connectPromise = null;
-      reject(err);
-    };
+  if (socket) {
+    // Preserve screen subscriptions across a failed connection attempt.
+    socket.data = { ...(socket.data || {}), localClosing: false, sessionReady: false };
+    socket.io.reconnection(true);
+    const ready = waitForSession(socket, INITIAL_CONNECTION_TIMEOUT_MS);
+    socket.connect();
+    return ready;
+  }
 
-    socket.once('joined', () => {
-      if (settled) return;
-      settled = true;
-      socket.data = { ...(socket.data || {}), sessionReady: true };
-      connectPromise = null;
-      resolve(socket);
-    });
-    socket.once('connect_error', fail);
-    socket.once('disconnect', (reason) => fail(new Error(reason || 'Disconnected')));
+  const serverUrl = getServerUrl();
+  socket = io(serverUrl, {
+    // WebSocket is preferred, but some mobile networks/proxies block upgrades.
+    // Polling remains HTTPS-protected and prevents those users being locked out.
+    transports: ['websocket', 'polling'],
+    tryAllTransports: true,
+    reconnection: true,
+    reconnectionAttempts: MAX_RECONNECT_ATTEMPTS,
+    reconnectionDelay: 100,
+    reconnectionDelayMax: 300,
+    randomizationFactor: 0.2,
+    timeout: CONNECTION_ATTEMPT_TIMEOUT_MS,
   });
-
-  return connectPromise;
+  socket.data = { ...(socket.data || {}), serverUrl, sessionReady: false };
+  attachReconnectPolicy(socket);
+  return waitForSession(socket, INITIAL_CONNECTION_TIMEOUT_MS);
 }
 
 export function ensureKeypair() {
   if (keyGenPromise) return keyGenPromise;
+  const epoch = sessionEpoch;
   keyGenPromise = generateKeys().catch((err) => {
-    keyGenPromise = null;
+    if (epoch === sessionEpoch) keyGenPromise = null;
     throw err;
   });
   return keyGenPromise;
@@ -90,13 +218,60 @@ export function getSocket() {
 
 export function disconnectSocket() {
   resetE2E();
+  clearReconnectDeadline();
+  socket?.io.reconnection(false);
   socket?.disconnect();
   socket = null;
   connectPromise = null;
 }
 
-export function findRandom() {
-  if (socket?.connected) socket.emit('find-random');
+export async function findRandom() {
+  await ensureCaptureProtection();
+  if (!socket?.connected) throw new Error('Not connected');
+  const response = await emitWithAck('find-random', {}, 7000);
+  if (!response?.ok) throw new Error(response?.error || 'Could not start matchmaking');
+  return response;
+}
+
+export async function getGroupCaptcha() {
+  if (!socket?.connected) throw new Error('Not connected');
+  const response = await emitWithAck('group-captcha', {}, 5000);
+  if (!response?.ok || !response.captcha?.id || !response.captcha?.question) {
+    throw new Error(response?.error || 'Could not load verification');
+  }
+  return response.captcha;
+}
+
+export async function getGroupStatus() {
+  if (!socket?.connected) throw new Error('Not connected');
+  const response = await emitWithAck('group-status', {}, 5000);
+  if (!response?.ok || !Number.isInteger(response.activeUsers) || response.activeUsers < 0 || typeof response.isActive !== 'boolean') {
+    throw new Error(response?.error || 'Could not load group status');
+  }
+  return { activeUsers: response.activeUsers, isActive: response.isActive };
+}
+
+export async function joinGroupChat(
+  username, captchaId, captchaAnswer, captchaIndex = 0, powSolution
+) {
+  if (!socket?.connected) throw new Error('Not connected');
+  resetE2E();
+  const response = await emitWithAck('join-group', {
+    username, captchaId, captchaAnswer, captchaIndex, powSolution,
+  }, 7000);
+  if (!response?.ok) throw new Error(response?.error || 'Could not join group chat');
+  return response;
+}
+
+export async function sendGroupMessage(text) {
+  if (!socket?.connected) throw new Error('Not connected');
+  const response = await emitWithAck('group-message', { text }, 5000);
+  if (!response?.ok) throw new Error(response?.error || 'Could not send message');
+  return response.message;
+}
+
+export function leaveGroupChat() {
+  if (socket?.connected) socket.emit('leave-group');
 }
 
 export function cancelSearch() {
@@ -104,7 +279,7 @@ export function cancelSearch() {
 }
 
 function randomInviteSecret() {
-  const bytes = ExpoCrypto.getRandomBytes(10);
+  const bytes = ExpoCrypto.getRandomBytes(32);
   let bits = 0;
   let bitCount = 0;
   let body = '';
@@ -117,6 +292,8 @@ function randomInviteSecret() {
       bits &= (1 << bitCount) - 1;
     }
   }
+  if (bitCount > 0) body += INVITE_ALPHABET[(bits << (5 - bitCount)) & 31];
+  bytes.fill(0);
   return body.match(/.{4}/g).join('-');
 }
 
@@ -142,41 +319,65 @@ function inviteLocator(code) {
 }
 
 function emitWithAck(event, data, timeoutMs = 5000) {
+  const target = socket;
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${event} timed out`)), timeoutMs);
-    socket.emit(event, data, (response) => {
+    if (!target?.connected) { reject(new Error('Not connected')); return; }
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
-      resolve(response);
-    });
+      pendingRequests.delete(cancel);
+      target.off('disconnect', disconnected);
+      if (error) reject(error); else resolve(value);
+    };
+    const cancel = () => finish(new Error('Chat ended'));
+    const disconnected = () => finish(new Error('Connection lost'));
+    const timer = setTimeout(() => finish(new Error(`${event} timed out`)), timeoutMs);
+    if (event === 'send-encrypted') pendingRequests.add(cancel);
+    target.once('disconnect', disconnected);
+    // Connected-only, bounded by the caller. Never silently drop requests when
+    // polling or WebSocket writes are busy. Socket.IO removes timed-out ACKs.
+    target.timeout(timeoutMs).emit(event, data, (error, response) => finish(error, response));
   });
 }
 
 export async function createInvite() {
+  await ensureCaptureProtection();
   if (!socket?.connected) throw new Error('Not connected');
-  const secret = randomInviteSecret();
-  const response = await emitWithAck('create-invite', {});
+  if (!pendingInviteRequest || pendingInviteRequest.connectionId !== socket.id) {
+    pendingInviteRequest = { connectionId: socket.id, requestId: createMessageId(), secret: randomInviteSecret() };
+  }
+  const request = pendingInviteRequest;
+  const response = await emitWithAck('create-invite', { requestId: request.requestId }, 8000);
+  if (pendingInviteRequest !== request) throw new Error('Invite cancelled');
   if (!response?.ok || typeof response.locator !== 'string') {
     throw new Error(response?.error || 'Could not create invite');
   }
-  const code = `${response.locator}-${secret}`;
+  const code = `${response.locator}-${request.secret}`;
   if (!isValidInviteCode(code)) throw new Error('Server returned an invalid invite locator');
   return code;
 }
 
 export function cancelInvite() {
+  pendingInviteRequest = null;
   if (socket?.connected) socket.emit('cancel-invite');
 }
 
-export function joinInvite(code) {
+export async function joinInvite(code) {
+  await ensureCaptureProtection();
   const locator = inviteLocator(code);
   if (!locator) throw new Error('Invalid invite code');
-  if (socket?.connected) socket.emit('join-invite', { locator });
+  if (!socket?.connected) throw new Error('Not connected');
+  socket.emit('join-invite', { locator });
 }
 
 export async function startKeyExchange() {
   if (!socket?.connected) return;
+  const epoch = sessionEpoch;
   const publicKey = await ensureKeypair();
-  socket.emit('key-exchange', { publicKey });
+  if (!isChatEpochActive(epoch) || !socket?.connected) return;
+  socket.emit('key-exchange', { publicKey, protocolVersion: 6 });
 }
 
 export function isE2EReady() {
@@ -184,25 +385,36 @@ export function isE2EReady() {
 }
 
 export function canSendMessages() {
-  return isReady() && chatVerified;
+  return activeRoomId !== null && socket?.connected && isReady() && chatVerified;
 }
 
-export function verifyChat() {
+export function confirmSecureChannel() {
+  const epoch = sessionEpoch;
   if (!socket?.connected || !isReady()) {
     return Promise.reject(new Error('Secure channel is not ready'));
   }
 
   const attempt = (triesLeft) => new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('Verification timed out')), 5000);
-    socket.emit('verify-chat', (response) => {
+    if (!isChatEpochActive(epoch) || !socket?.connected) {
+      reject(new Error('Chat ended')); return;
+    }
+    let settled = false;
+    const timer = setTimeout(() => {
+      settled = true;
+      reject(new Error('Verification timed out'));
+    }, 5000);
+    socket.emit('secure-channel-ready', (response) => {
       clearTimeout(timer);
+      if (settled) return;
+      settled = true;
+      if (!isChatEpochActive(epoch)) { reject(new Error('Chat ended')); return; }
       if (response?.ok) {
         chatVerified = true;
         resolve(true);
         return;
       }
-      const peerIncomplete = /peer key/i.test(response?.error || '');
-      if (peerIncomplete && triesLeft > 0) {
+      const handshakeIncomplete = /(peer key|key confirmation)/i.test(response?.error || '');
+      if (handshakeIncomplete && triesLeft > 0) {
         setTimeout(() => {
           attempt(triesLeft - 1).then(resolve, reject);
         }, 400);
@@ -215,40 +427,73 @@ export function verifyChat() {
   return attempt(8);
 }
 
+export const verifyChat = confirmSecureChannel;
+
 export function resetE2E() {
+  clearMediaTransfers();
+  for (const waiter of chunkWaiters.values()) waiter.reject(new Error('Chat ended'));
+  chunkWaiters.clear();
+  activeMediaSends.clear();
+  receivedSequences.clear();
+  sessionEpoch += 1;
+  activeRoomId = null;
+  allowSavingMyMedia = false;
+  for (const cancel of [...pendingRequests]) cancel();
+  queuedCharacters = 0;
+  queuedMessages = 0;
   keyGenPromise = null;
   chatVerified = false;
   sendSequence = 0;
   receiveSequence = 0;
   setInviteBinding(null);
+  setRoomBinding(null);
   destroyE2E();
 }
 
-function isValidBase64(value, maxCharacters) {
-  return typeof value === 'string' &&
-    value.length > 0 && value.length <= maxCharacters && value.length % 4 === 0 &&
-    /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value);
-}
-
 function validateMessageBody(body) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+  if (!body || typeof body !== 'object' || Array.isArray(body) || 'fileUri' in body) return false;
+  if (!MESSAGE_ID_RE.test(body.messageId || '')) return false;
+  if (body.type === 'receipt') return MESSAGE_ID_RE.test(body.receiptFor || '');
+  if (body.type === 'media-chunk') {
+    const d = body.descriptor;
+    return MESSAGE_ID_RE.test(body.transferId || '') &&
+      Number.isInteger(body.count) && body.count > 0 && Number.isSafeInteger(body.count) &&
+      Number.isInteger(body.index) && body.index >= 0 && body.index < body.count &&
+      isValidBase64(body.data, CHUNK_CHARS) &&
+      (body.index === body.count - 1 || body.data.length === CHUNK_CHARS) &&
+      d && ['image', 'video', 'file'].includes(d.type) && typeof d.allowSaving === 'boolean' &&
+      typeof d.mimeType === 'string' && SAFE_MIME_RE.test(d.mimeType) &&
+      typeof d.fileName === 'string' && d.fileName.length <= 255 &&
+      Number.isSafeInteger(d.fileSize) && d.fileSize > 0 &&
+      body.count === Math.ceil(d.fileSize / CHUNK_BYTES);
+  }
+  if (body.type === 'media-chunk-ack') return MESSAGE_ID_RE.test(body.transferId || '') && Number.isSafeInteger(body.index) && body.index >= 0;
+  if (body.type === 'media-transfer-error') return MESSAGE_ID_RE.test(body.transferId || '');
+  if (body.type === 'media-policy') return typeof body.allowSaving === 'boolean';
+  if (body.type === 'typing') return typeof body.active === 'boolean';
+  if (body.type === 'security-notice') return ['screenshot', 'recording', 'overlay'].includes(body.event);
+  if (body.type === 'session-close') return body.reason === 'left';
+  if (body.type === 'heartbeat' || body.type === 'heartbeat-response') return MESSAGE_ID_RE.test(body.challenge || '');
   if (body.type === 'text') return typeof body.text === 'string' && body.text.length <= 2000;
   if (!['image', 'video', 'file'].includes(body.type)) return false;
 
   const dataField = body.type === 'image' ? 'imageData' : body.type === 'video' ? 'videoData' : 'fileData';
-  if (!isValidBase64(body[dataField], MAX_MEDIA_BASE64_CHARS)) return false;
+  if (!isValidBase64(body[dataField], MAX_INLINE_MEDIA_BASE64_CHARS)) return false;
+  if (typeof body.allowSaving !== 'boolean') return false;
+  const byteLength = base64ByteLength(body[dataField]);
+  if (byteLength > MAX_INLINE_MEDIA_BYTES) return false;
   if (typeof body.mimeType !== 'string' || !SAFE_MIME_RE.test(body.mimeType)) return false;
   if (body.type === 'image' && !IMAGE_MIME_TYPES.has(body.mimeType)) return false;
   if (body.type === 'video' && !VIDEO_MIME_TYPES.has(body.mimeType)) return false;
   if (body.type === 'file') {
     if (typeof body.fileName !== 'string' || body.fileName.length < 1 || body.fileName.length > 255) return false;
     if (/[\u0000-\u001F\u007F\u202A-\u202E\u2066-\u2069]/.test(body.fileName)) return false;
-    if (!Number.isInteger(body.fileSize) || body.fileSize < 0 || body.fileSize > MAX_MEDIA_BYTES) return false;
+    if (!Number.isInteger(body.fileSize) || body.fileSize !== byteLength) return false;
   }
   return true;
 }
 
-export function decryptIncoming(encrypted) {
+export function decryptIncoming(encrypted, expectedMessageId) {
   if (!isValidBase64(encrypted, MAX_RECEIVED_ENCRYPTED_CHARS)) {
     throw new Error('Invalid encrypted payload');
   }
@@ -256,41 +501,184 @@ export function decryptIncoming(encrypted) {
   if (typeof plaintext !== 'string') throw new Error('Message authentication failed');
 
   const envelope = JSON.parse(plaintext);
-  if (envelope?.v !== 1 || !Number.isSafeInteger(envelope.seq) || envelope.seq <= receiveSequence) {
+  if (envelope?.v !== 6 || envelope.roomId !== activeRoomId ||
+      !Number.isSafeInteger(envelope.seq) || envelope.seq < 1 ||
+      envelope.seq <= receiveSequence - 256 || receivedSequences.has(envelope.seq)) {
     throw new Error('Replayed or invalid message');
   }
   if (!validateMessageBody(envelope.body)) throw new Error('Invalid message schema');
+  if (envelope.body.messageId !== expectedMessageId) throw new Error('Message identifier mismatch');
 
-  receiveSequence = envelope.seq;
+  receiveSequence = Math.max(receiveSequence, envelope.seq);
+  receivedSequences.add(envelope.seq);
+  for (const sequence of receivedSequences) {
+    if (sequence <= receiveSequence - 256) receivedSequences.delete(sequence);
+  }
+  if (envelope.body.type === 'media-chunk') {
+    const chunk = envelope.body;
+    try {
+      const assembled = acceptMediaChunk(chunk);
+      sendEncrypted({ type: 'media-chunk-ack', transferId: chunk.transferId, index: chunk.index }).catch(() => {});
+      return assembled;
+    } catch {
+      sendEncrypted({ type: 'media-transfer-error', transferId: chunk.transferId }).catch(() => {});
+      return { type: 'system', messageId: createMessageId(), text: 'An attachment could not be received. Check free storage and ask the sender to retry.' };
+    }
+  }
+  if (envelope.body.type === 'media-chunk-ack') {
+    chunkWaiters.get(`${envelope.body.transferId}:${envelope.body.index}`)?.resolve();
+    return null;
+  }
+  if (envelope.body.type === 'media-transfer-error') {
+    for (const [key, waiter] of chunkWaiters) {
+      if (key.startsWith(`${envelope.body.transferId}:`)) waiter.reject(new Error('Recipient could not receive the attachment'));
+    }
+    return null;
+  }
   return envelope.body;
 }
 
-function sendEncrypted(body) {
-  if (!socket?.connected || !canSendMessages() || !validateMessageBody(body)) return false;
-  const envelope = { v: 1, seq: ++sendSequence, body };
-  socket.emit('send-encrypted', { encrypted: encrypt(JSON.stringify(envelope)) });
-  return true;
+export function createMessageId() {
+  return ExpoCrypto.randomUUID();
 }
 
-export function sendMessage(text) {
-  return sendEncrypted({ type: 'text', text });
+async function sendEncrypted(body, messageId = createMessageId()) {
+  const finalBody = { ...body, messageId };
+  if (!socket?.connected || !canSendMessages() || !validateMessageBody(finalBody)) {
+    throw new Error('Message is invalid or the secure channel is unavailable');
+  }
+  if (queuedMessages >= 24 || queuedCharacters >= MAX_RECEIVED_ENCRYPTED_CHARS) {
+    throw new Error('Wait for the current messages to finish sending');
+  }
+  const epoch = sessionEpoch;
+  const sequence = ++sendSequence;
+  const envelope = { v: 6, roomId: activeRoomId, seq: sequence, body: finalBody };
+  const encrypted = encrypt(JSON.stringify(envelope), sequence);
+  if (queuedCharacters + encrypted.length > MAX_RECEIVED_ENCRYPTED_CHARS) {
+    throw new Error('Wait for the current attachment to finish sending');
+  }
+  queuedCharacters += encrypted.length;
+  queuedMessages += 1;
+  const operation = (async () => {
+    let lastError = null;
+
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      if (!isChatEpochActive(epoch)) throw new Error('Chat ended');
+      try {
+        const response = await emitWithAck('send-encrypted', { encrypted, messageId }, 8000);
+        if (!isChatEpochActive(epoch)) throw new Error('Chat ended');
+        if (!response?.ok || response.messageId !== messageId) {
+          const rejection = new Error(response?.error || 'Relay rejected the message');
+          rejection.retryable = response?.retryable === true;
+          rejection.retryAfterMs = Math.min(2000, Math.max(150, Number(response?.retryAfterMs) || 150));
+          throw rejection;
+        }
+        return messageId;
+      } catch (error) {
+        lastError = error;
+        if (error?.retryable === false || attempt >= 7 || !socket?.connected) break;
+        await new Promise((resolve) => setTimeout(resolve, lastError?.retryAfterMs || 150));
+      }
+    }
+    throw lastError || new Error('Message delivery failed');
+  })();
+  return operation.finally(() => {
+    if (sessionEpoch === epoch) {
+      queuedCharacters -= encrypted.length;
+      queuedMessages -= 1;
+    }
+  });
 }
 
-export function sendImage(imageData, mimeType) {
-  return sendEncrypted({ type: 'image', imageData, mimeType });
+export function sendMessage(text, messageId) {
+  return sendEncrypted({ type: 'text', text }, messageId);
 }
 
-export function sendVideo(videoData, mimeType) {
-  return sendEncrypted({ type: 'video', videoData, mimeType });
+async function sendMedia(type, data, mimeType, fileName, messageId = createMessageId(), onProgress) {
+  if (activeMediaSends.size >= 2) throw new Error('Two attachments are already sending');
+  const epoch = sessionEpoch;
+  const file = data?.fileUri && isOwnedAttachment(data.fileUri) ? new File(data.fileUri) : null;
+  if (!file && !isValidBase64(data, MAX_INLINE_MEDIA_BASE64_CHARS)) throw new Error('Invalid attachment');
+  const size = file ? file.size : base64ByteLength(data);
+  if (!Number.isSafeInteger(size) || size <= 0) throw new Error('Empty or invalid attachment');
+  const descriptor = { type, mimeType, fileName: fileName || 'Whisperchat', fileSize: size, allowSaving: allowSavingMyMedia };
+  const count = Math.ceil(size / CHUNK_BYTES);
+  let handle;
+  let acknowledged = 0;
+  activeMediaSends.add(messageId);
+  onProgress?.(0);
+  try {
+    handle = file?.open();
+    for (let start = 0; start < count; start += 4) {
+      if (!isChatEpochActive(epoch)) throw new Error('Chat ended');
+      await Promise.all(Array.from({ length: Math.min(4, count - start) }, async (_, offset) => {
+        const index = start + offset;
+        let part;
+        if (handle) {
+          handle.offset = index * CHUNK_BYTES;
+          const bytes = handle.readBytes(Math.min(CHUNK_BYTES, size - index * CHUNK_BYTES));
+          if (bytes.length !== Math.min(CHUNK_BYTES, size - index * CHUNK_BYTES)) throw new Error('Attachment changed');
+          part = encodeChunk(bytes); bytes.fill(0);
+        } else part = data.slice(index * CHUNK_CHARS, (index + 1) * CHUNK_CHARS);
+        const key = `${messageId}:${index}`;
+        let timer;
+        const receipt = new Promise((resolve, reject) => {
+          chunkWaiters.set(key, { resolve, reject });
+          timer = setTimeout(() => reject(new Error('Recipient stopped receiving')), 30000);
+        });
+        receipt.catch(() => {});
+        try {
+          await sendEncrypted({ type: 'media-chunk', transferId: messageId, descriptor, index, count, data: part });
+          await receipt;
+          if (!isChatEpochActive(epoch)) throw new Error('Chat ended');
+          acknowledged += base64ByteLength(part);
+          onProgress?.(acknowledged / size);
+        } finally { clearTimeout(timer); chunkWaiters.delete(key); }
+      }));
+    }
+    return messageId;
+  } finally {
+    handle?.close();
+    activeMediaSends.delete(messageId);
+    for (const [key, waiter] of chunkWaiters) if (key.startsWith(`${messageId}:`)) waiter.reject(new Error('Transfer stopped'));
+  }
 }
 
-export function sendFile(fileData, mimeType, fileName, fileSize) {
-  return sendEncrypted({ type: 'file', fileData, mimeType, fileName, fileSize });
+export function sendImage(imageData, mimeType, messageId, onProgress) {
+  return sendMedia('image', imageData, mimeType, '', messageId, onProgress);
+}
+
+export function sendVideo(videoData, mimeType, messageId, onProgress) {
+  return sendMedia('video', videoData, mimeType, '', messageId, onProgress);
+}
+
+export function sendFile(fileData, mimeType, fileName, fileSize, messageId, onProgress) {
+  return sendMedia('file', fileData, mimeType, fileName, messageId, onProgress);
+}
+
+export async function setMediaSavingAllowed(allowed) {
+  if (typeof allowed !== 'boolean' || !canSendMessages()) throw new Error('Chat is not ready');
+  const epoch = sessionEpoch;
+  await sendEncrypted({ type: 'media-policy', allowSaving: allowed });
+  if (!isChatEpochActive(epoch)) throw new Error('Chat ended');
+  allowSavingMyMedia = allowed;
+}
+
+export function sendSecurityNotice(event) {
+  return sendEncrypted({ type: 'security-notice', event });
+}
+
+export function sendHeartbeat(challenge, response = false) {
+  return sendEncrypted({ type: response ? 'heartbeat-response' : 'heartbeat', challenge });
+}
+
+export function sendReceipt(receiptFor) {
+  return sendEncrypted({ type: 'receipt', receiptFor });
 }
 
 export function sendTyping(active) {
-  if (socket?.connected && chatVerified && typeof active === 'boolean') {
-    socket.emit('typing', { active });
+  if (canSendMessages() && typeof active === 'boolean') {
+    sendEncrypted({ type: 'typing', active }).catch(() => {});
   }
 }
 
@@ -299,5 +687,14 @@ export function reportUser() {
 }
 
 export function leaveRoom() {
-  if (socket?.connected) socket.emit('leave-room');
+  const target = socket;
+  resetE2E(); // Clear local content/keys immediately, independently of the ACK.
+  if (!target || target.data?.localClosing) return;
+  target.data = { ...(target.data || {}), localClosing: true };
+  target.io.reconnection(false);
+  if (!target.connected) { target.disconnect(); return; }
+  const connectionId = target.id;
+  target.timeout(1200).emit('leave-room', {}, () => {
+    if (target.id === connectionId && target.data?.localClosing) target.disconnect();
+  });
 }

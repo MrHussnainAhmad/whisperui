@@ -1,0 +1,6 @@
+{
+  "name": "whisper-privacy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local native privacy lifecycle for Whisper"
+}

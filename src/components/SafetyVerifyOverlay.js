@@ -34,7 +34,7 @@ export default function SafetyVerifyOverlay({ safetyCode, onVerify, onLeave }) {
           Verify invite
         </Text>
         <Text style={[typography.caption, { color: colors.textSecondary, textAlign: 'center', lineHeight: 19, marginBottom: sp.lg }]}>
-          Ask your contact for their Safety Code. It must match exactly — by call or in person.
+          Compare this Safety Code with your contact by call or in person. Only continue if both screens match exactly.
         </Text>
 
         <Text style={[typography.overline, { color: colors.textTertiary, textAlign: 'center', marginBottom: sp.xs + 2 }]}>
@@ -60,7 +60,7 @@ export default function SafetyVerifyOverlay({ safetyCode, onVerify, onLeave }) {
           variant="primary"
           size="lg"
           fullWidth
-          title="Codes match — start chat"
+          title="I compared codes - start chat"
           icon="checkmark-circle"
           onPress={onVerify}
         />

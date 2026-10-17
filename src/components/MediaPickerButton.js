@@ -1,12 +1,19 @@
-import React, { useState } from 'react';
-import { View, TouchableOpacity, Text, StyleSheet, Modal, Pressable, Alert, ActivityIndicator } from 'react-native';
+import React, { useState, useRef } from 'react';
+import { View, TouchableOpacity, Text, StyleSheet, Modal, Pressable, Alert, ActivityIndicator, Platform } from 'react-native';
 import * as ImagePicker from 'expo-image-picker';
+import * as ImageManipulator from 'expo-image-manipulator';
+import { cleanJpegFile, deleteAttachment } from '../services/attachmentFiles';
+import { prepareAttachment } from '../services/prepareAttachment';
+import { cleanAbandonedCaptures } from '../services/cameraCache';
+import { cleanVideo } from '../services/documentMedia';
 import * as DocumentPicker from 'expo-document-picker';
+import { Camera } from 'expo-camera';
 import * as FileSystem from 'expo-file-system/legacy';
 import Icon from './Icon';
 import { sp, radius, shadows } from '../theme';
 import { useTheme } from '../hooks/useTheme';
 import { useResponsiveLayout } from '../hooks/useResponsiveLayout';
+import { getChatEpoch, isChatEpochActive } from '../services/socket';
 
 const OPTS = [
   { key: 'camera', icon: 'camera-outline', label: 'Camera' },
@@ -15,37 +22,61 @@ const OPTS = [
   { key: 'file', icon: 'document-text-outline', label: 'File' },
 ];
 
-const MAX_MEDIA_BYTES = 3_000_000;
-const MAX_MEDIA_BASE64_CHARS = 4_000_000;
 
-export default function MediaPickerButton({ onImageSelected, onVideoSelected, onFileSelected, disabled = false }) {
+function confirmPrivacyWarning(title, message) {
+  return new Promise((resolve) => {
+    Alert.alert(title, message, [
+      { text: 'Cancel', style: 'cancel', onPress: () => resolve(false) },
+      { text: 'Send', onPress: () => resolve(true) },
+    ], { cancelable: true, onDismiss: () => resolve(false) });
+  });
+}
+
+export default function MediaPickerButton({ onImageSelected, onVideoSelected, onFileSelected, onProcessingChange, onOpenCamera, disabled = false }) {
   const [open, setOpen] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isPicking, setIsPicking] = useState(false);
+  const pickingRef = useRef(false);
+  const pendingPick = useRef(null);
   const { colors, typography } = useTheme();
   const { isTablet, touchMin } = useResponsiveLayout();
-  const isDisabled = disabled || isProcessing;
+  const isDisabled = disabled || isProcessing || isPicking;
 
   const pick = async (key) => {
-    if (isDisabled) return;
+    if (isDisabled || pickingRef.current) return;
+    pickingRef.current = true;
+    setIsPicking(true);
     setOpen(false);
-    setIsProcessing(true);
+    const epoch = getChatEpoch();
+    const ownedCopies = [];
+    const rememberCopy = (uri) => {
+      if (typeof uri === 'string' && FileSystem.cacheDirectory && uri.startsWith(FileSystem.cacheDirectory)) ownedCopies.push(uri);
+    };
+    onProcessingChange?.(true);
     try {
       if (key === 'camera') {
-        const p = await ImagePicker.requestCameraPermissionsAsync();
-        if (!p.granted) { setIsProcessing(false); return; }
-        const r = await ImagePicker.launchCameraAsync({
-          quality: 0.45,
-          base64: true,
-          allowsEditing: false,
-          exif: false,
-        });
-        if (!r.canceled && r.assets?.[0]) {
-          const imageData = r.assets[0].base64;
-          if (!imageData || imageData.length > MAX_MEDIA_BASE64_CHARS) {
-            Alert.alert('Too large', 'Image must be under 3 MB. Try a smaller photo.');
-          } else {
-            onImageSelected({ imageData, mimeType: r.assets[0].mimeType || 'image/jpeg' });
-          }
+        await cleanAbandonedCaptures();
+        const permission = await Camera.requestCameraPermissionsAsync();
+        if (!permission.granted) { Alert.alert('Camera permission', 'Allow camera access to take photos or videos.'); return; }
+        if (!isChatEpochActive(epoch)) return;
+        const asset = await onOpenCamera?.();
+        if (!asset) return;
+        rememberCopy(asset.uri);
+        if (!isChatEpochActive(epoch)) return;
+        setIsProcessing(true);
+        if (asset.type === 'video') {
+          const prepared = await cleanVideo(asset.uri, confirmPrivacyWarning);
+          if (!prepared) return;
+          if (isChatEpochActive(epoch)) onVideoSelected({ ...prepared, mimeType: prepared.mimeType || 'video/mp4' });
+          else deleteAttachment(prepared.fileUri);
+        } else {
+          const resized = await ImageManipulator.manipulateAsync(asset.uri,
+            [],
+            { compress: 1, format: ImageManipulator.SaveFormat.JPEG, base64: false });
+          rememberCopy(resized.uri);
+          const prepared = cleanJpegFile(resized.uri);
+          if (isChatEpochActive(epoch)) onImageSelected({ ...prepared, mimeType: 'image/jpeg' });
+          else deleteAttachment(prepared.fileUri);
         }
       }
       else if (key === 'photo') {
@@ -53,62 +84,68 @@ export default function MediaPickerButton({ onImageSelected, onVideoSelected, on
         if (!p.granted) { setIsProcessing(false); return; }
         const r = await ImagePicker.launchImageLibraryAsync({
           mediaTypes: ['images'],
-          quality: 0.45,
-          base64: true,
+          quality: 1,
+          base64: false,
           allowsEditing: false,
           exif: false,
         });
         if (!r.canceled && r.assets?.[0]) {
-          const imageData = r.assets[0].base64;
-          if (!imageData || imageData.length > MAX_MEDIA_BASE64_CHARS) {
-            Alert.alert('Too large', 'Image must be under 3 MB. Try a smaller photo.');
-          } else {
-            onImageSelected({ imageData, mimeType: r.assets[0].mimeType || 'image/jpeg' });
-          }
+          rememberCopy(r.assets[0].uri);
+          if (!isChatEpochActive(epoch)) return;
+          setIsProcessing(true);
+          const asset = r.assets[0];
+          if (asset.width * asset.height > 50_000_000) throw new Error('Photo dimensions too large');
+          const resized = await ImageManipulator.manipulateAsync(asset.uri,
+            [],
+            { compress: 1, format: ImageManipulator.SaveFormat.JPEG, base64: false });
+          rememberCopy(resized.uri);
+          if (!isChatEpochActive(epoch)) return;
+          const prepared = cleanJpegFile(resized.uri);
+          if (isChatEpochActive(epoch)) onImageSelected({ ...prepared, mimeType: 'image/jpeg' });
+          else deleteAttachment(prepared.fileUri);
         }
       }
       else if (key === 'video') {
-        const p = await ImagePicker.requestMediaLibraryPermissionsAsync();
-        if (!p.granted) { setIsProcessing(false); return; }
         const r = await ImagePicker.launchImageLibraryAsync({
           mediaTypes: ['videos'],
-          quality: 0.4,
-          videoMaxDuration: 30,
+          allowsEditing: false,
         });
         if (!r.canceled && r.assets?.[0]) {
           const a = r.assets[0];
-          const size = a.fileSize ?? a.size ?? 0;
-          if (size > MAX_MEDIA_BYTES) {
-            Alert.alert('Too large', 'Video must be under 3 MB.');
-            setIsProcessing(false);
-            return;
-          }
-          const b64 = await FileSystem.readAsStringAsync(a.uri, { encoding: 'base64' });
-          if (b64.length > MAX_MEDIA_BASE64_CHARS) {
-            Alert.alert('Too large', 'Video must be under 3 MB.');
-            setIsProcessing(false);
-            return;
-          }
-          onVideoSelected({ videoData: b64, mimeType: a.mimeType || 'video/mp4' });
+          rememberCopy(a.uri);
+          if (!isChatEpochActive(epoch)) return;
+          setIsProcessing(true);
+          const prepared = await cleanVideo(a.uri, confirmPrivacyWarning, a.mimeType);
+          if (!prepared) return;
+          if (isChatEpochActive(epoch)) onVideoSelected({ ...prepared, mimeType: prepared.mimeType || 'video/mp4' });
+          else deleteAttachment(prepared.fileUri);
         }
       }
       else if (key === 'file') {
         const r = await DocumentPicker.getDocumentAsync({ type: '*/*', copyToCacheDirectory: true });
         if (!r.canceled && r.assets?.[0]) {
           const a = r.assets[0];
-          if (a.size > MAX_MEDIA_BYTES) {
-            Alert.alert('Too large', 'File must be under 3 MB.');
+          rememberCopy(a.uri);
+          if (!isChatEpochActive(epoch)) return;
+          setIsProcessing(true);
+          const payload = await prepareAttachment(a, () => isChatEpochActive(epoch), async (...args) => {
             setIsProcessing(false);
-            return;
-          }
-          const b64 = await FileSystem.readAsStringAsync(a.uri, { encoding: 'base64' });
-          onFileSelected({ fileData: b64, mimeType: a.mimeType || 'application/octet-stream', fileName: a.name || 'file', fileSize: a.size || 0 });
+            const confirmed = await confirmPrivacyWarning(...args);
+            if (confirmed) setIsProcessing(true);
+            return confirmed;
+          });
+          if (payload && isChatEpochActive(epoch)) onFileSelected(payload);
+          else if (payload?.fileUri) deleteAttachment(payload.fileUri);
         }
       }
     } catch (err) {
-      Alert.alert('Error', `Could not process media: ${err.message || 'Unknown error'}`);
+      if (isChatEpochActive(epoch)) Alert.alert('Unable to attach', /^(For private sharing|Install the updated|Attachment must|Prepared attachment|PDFs are limited|Rendered PDF exceeds)/.test(err?.message || '') ? err.message : 'This file could not be prepared safely. Try a smaller file or convert it to PDF or plain text.');
     } finally {
+      await Promise.all(ownedCopies.map((uri) => FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {})));
+      pickingRef.current = false;
+      setIsPicking(false);
       setIsProcessing(false);
+      onProcessingChange?.(false);
     }
   };
 
@@ -129,7 +166,12 @@ export default function MediaPickerButton({ onImageSelected, onVideoSelected, on
         <Icon name="add" size={isTablet ? 24 : 22} color={isDisabled ? colors.textTertiary : colors.accent} />
       </TouchableOpacity>
 
-      <Modal visible={open} transparent animationType="slide" onRequestClose={() => setOpen(false)}>
+      <Modal visible={open} transparent animationType="slide" onRequestClose={() => setOpen(false)}
+        onDismiss={() => {
+          const key = pendingPick.current;
+          pendingPick.current = null;
+          if (key) pick(key);
+        }}>
         <Pressable style={[s.overlay, { backgroundColor: colors.overlay }]} onPress={() => setOpen(false)}>
           <Pressable onPress={() => {}}>
             <View
@@ -146,7 +188,12 @@ export default function MediaPickerButton({ onImageSelected, onVideoSelected, on
                     key={o.key}
                     style={[s.optBtn, isTablet && s.optBtnTablet]}
                     activeOpacity={0.7}
-                    onPress={() => pick(o.key)}
+                    onPress={() => {
+                      if (Platform.OS === 'ios') {
+                        pendingPick.current = o.key;
+                        setOpen(false);
+                      } else pick(o.key);
+                    }}
                     accessibilityRole="button"
                     accessibilityLabel={o.label}
                   >
@@ -173,17 +220,11 @@ export default function MediaPickerButton({ onImageSelected, onVideoSelected, on
         </Pressable>
       </Modal>
 
-      {/* Global Processing Loader */}
-      {isProcessing && (
-        <Modal transparent visible={true}>
-          <View style={[s.processingContainer, { backgroundColor: colors.overlay }]}>
-            <View style={[s.processingBox, { backgroundColor: colors.surface1, borderColor: colors.hairline }]}>
-              <ActivityIndicator size="large" color={colors.accent} />
-              <Text style={[typography.body, { color: colors.text, marginTop: sp.md }]}>Processing...</Text>
-            </View>
-          </View>
-        </Modal>
-      )}
+      {isProcessing && <View accessibilityRole="progressbar" accessibilityLabel="Preparing attachment" style={{ alignItems: 'center' }}>
+        <ActivityIndicator size="small" color={colors.accent} />
+        <Text style={[typography.micro, { color: colors.textSecondary }]}>Preparing…</Text>
+      </View>}
+
     </View>
   );
 }

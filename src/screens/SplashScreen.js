@@ -1,8 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, Animated, StyleSheet, Image, Alert } from 'react-native';
+import React, { useEffect, useRef } from 'react';
+import { View, Text, Animated, StyleSheet, Image } from 'react-native';
 import StatusBar from '../components/StatusBar';
-import { connectSocket } from '../services/socket';
-import { getServerUrl } from '../config';
 import { sp, radius, shadows } from '../theme';
 import { useTheme } from '../hooks/useTheme';
 import { useResponsiveLayout } from '../hooks/useResponsiveLayout';
@@ -12,7 +10,6 @@ export default function SplashScreen({ navigation }) {
   const { isTablet } = useResponsiveLayout();
   const fade = useRef(new Animated.Value(0)).current;
   const slide = useRef(new Animated.Value(20)).current;
-  const [status, setStatus] = useState('Connecting…');
 
   useEffect(() => {
     let cancelled = false;
@@ -24,21 +21,6 @@ export default function SplashScreen({ navigation }) {
 
     const run = async () => {
       const started = Date.now();
-      try {
-        await connectSocket();
-        if (!cancelled) setStatus('Ready');
-      } catch (err) {
-        if (!cancelled) {
-          setStatus('Offline');
-          let target = 'unknown';
-          try { target = getServerUrl(); } catch { /* ignore */ }
-          Alert.alert(
-            'Connection issue',
-            `Could not reach the chat server at:\n${target}\n\n${err?.message || 'Network error'}\n\nSame Wi‑Fi as your PC? Restart Expo with cache clear after changing .env.`,
-          );
-        }
-      }
-
       const remaining = Math.max(0, 2500 - (Date.now() - started));
       if (remaining > 0) {
         await new Promise((resolve) => setTimeout(resolve, remaining));
@@ -64,7 +46,7 @@ export default function SplashScreen({ navigation }) {
           No signup. No history. Just talk.
         </Text>
         <Text style={[typography.caption, { color: colors.textTertiary, marginTop: sp.md }]}>
-          {status}
+          Connecting...
         </Text>
       </Animated.View>
       <Animated.Text style={[s.footer, { opacity: fade, color: colors.textTertiary }]}>

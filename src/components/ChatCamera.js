@@ -1,0 +1,138 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { View, Text, Image, TouchableOpacity, StyleSheet, Alert, BackHandler, AppState, Platform } from 'react-native';
+import { CameraView, Camera } from 'expo-camera';
+import * as FileSystem from 'expo-file-system/legacy';
+import PrivateVideo from './PrivateVideo';
+
+// Render inside the chat's secure native window, never an external camera app.
+export default function ChatCamera({ onDone }) {
+  const camera = useRef(null);
+  const active = useRef(true);
+  const busy = useRef(false);
+  const owned = useRef(null);
+  const callback = useRef(onDone);
+  callback.current = onDone;
+  const [mode, setMode] = useState('picture');
+  const [facing, setFacing] = useState('back');
+  const [ready, setReady] = useState(false);
+  const [pictureSize, setPictureSize] = useState(undefined);
+  const configuredCamera = useRef(null);
+  const [recording, setRecording] = useState(false);
+  const [working, setWorking] = useState(false);
+  const [preview, setPreview] = useState(null);
+  const remove = (uri) => uri ? FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {}) : Promise.resolve();
+  const close = () => {
+    active.current = false;
+    camera.current?.stopRecording();
+    callback.current(null);
+  };
+  useEffect(() => {
+    const back = BackHandler.addEventListener('hardwareBackPress', () => { close(); return true; });
+    const state = AppState.addEventListener('change', (next) => {
+      if (next === 'background') close();
+    });
+    return () => {
+      active.current = false;
+      camera.current?.stopRecording();
+      remove(owned.current);
+      back.remove(); state.remove();
+    };
+  }, []);
+  const capture = async () => {
+    if (recording) { camera.current?.stopRecording(); return; }
+    if (!ready || busy.current) return;
+    busy.current = true; setWorking(true);
+    try {
+      if (mode === 'video') setRecording(true);
+      const result = mode === 'video'
+        ? await camera.current.recordAsync()
+        : await camera.current.takePictureAsync({ quality: 1, exif: false });
+      if (!result?.uri) return;
+      if (!active.current) { await remove(result.uri); return; }
+      owned.current = result.uri;
+      setPreview({ ...result, type: mode === 'video' ? 'video' : 'image' });
+    } catch {
+      if (active.current) Alert.alert('Camera unavailable', 'Could not capture media. Please try again.');
+    } finally {
+      busy.current = false;
+      if (active.current) { setWorking(false); setRecording(false); }
+    }
+  };
+  const selectMode = async (next) => {
+    if (busy.current || next === mode) return;
+    busy.current = true;
+    try {
+      if (next === 'video') {
+        const permission = await Camera.requestMicrophonePermissionsAsync();
+        if (!active.current) return;
+        if (!permission.granted) { Alert.alert('Microphone permission', 'Allow microphone access to record video with sound.'); return; }
+      }
+      setPictureSize(undefined); setReady(false); setMode(next);
+    } finally { busy.current = false; }
+  };
+  return <View style={s.cover}>
+    <View style={s.header}><TouchableOpacity onPress={close} style={s.button} accessibilityLabel="Close camera"><Text style={s.text}>Cancel</Text></TouchableOpacity>
+      <Text style={s.text}>{recording ? 'Recording — tap Stop' : preview ? 'Review capture' : 'Camera'}</Text></View>
+    {preview ? <>
+      {preview.type === 'image' ? <Image source={{ uri: preview.uri }} style={s.preview} resizeMode="contain" />
+        : <PrivateVideo uri={preview.uri} playing={true} style={s.preview} />}
+      <View style={s.row}>
+        <TouchableOpacity disabled={working} style={s.button} onPress={async () => {
+          if (busy.current) return;
+          busy.current = true; setWorking(true);
+          await remove(owned.current); owned.current = null;
+          busy.current = false;
+          if (active.current) { setWorking(false); setReady(false); setPreview(null); }
+        }}><Text style={s.text}>Retake</Text></TouchableOpacity>
+        <TouchableOpacity disabled={working} style={s.button} onPress={() => {
+          if (!active.current || busy.current) return;
+          owned.current = null; // Ownership transfers to attachment preparation.
+          active.current = false;
+          callback.current(preview);
+        }}><Text style={s.text}>Use {preview.type === 'image' ? 'photo' : 'video'}</Text></TouchableOpacity>
+      </View>
+    </> : <>
+      <CameraView key={`${mode}-${facing}`} ref={camera} style={s.preview} mode={mode} facing={facing}
+        videoQuality="2160p" pictureSize={Platform.OS === 'ios' ? 'Photo' : pictureSize}
+        onCameraReady={async () => {
+          const view = camera.current;
+          if (Platform.OS === 'android' && mode === 'picture' && configuredCamera.current !== view) {
+            configuredCamera.current = view;
+            try {
+              const sizes = await view.getAvailablePictureSizesAsync();
+              if (!active.current || camera.current !== view) return;
+              const supported = sizes.map((size) => {
+                const match = /^(\d+)x(\d+)$/.exec(size);
+                return { size, area: match ? Number(match[1]) * Number(match[2]) : 0 };
+              }).filter((item) => item.area > 0).sort((a, b) => b.area - a.area);
+              if (supported[0]) setPictureSize(supported[0].size);
+            } catch {
+              if (active.current) Alert.alert('Camera quality', 'Could not read available photo sizes. The camera will use its default size.');
+            }
+          }
+          if (active.current) setReady(true);
+        }}
+        onMountError={() => { Alert.alert('Camera unavailable', 'Close the camera and try again.'); close(); }} />
+      <View style={s.row}>
+        <TouchableOpacity disabled={working} style={s.button} onPress={() => selectMode('picture')}><Text style={[s.text, mode === 'picture' && s.selected]}>Photo</Text></TouchableOpacity>
+        <TouchableOpacity disabled={working} style={s.button} onPress={() => selectMode('video')}><Text style={[s.text, mode === 'video' && s.selected]}>Video</Text></TouchableOpacity>
+      </View>
+      <Text style={[s.text, { textAlign: 'center', fontSize: 12, padding: 8 }]}>Private capture · Not saved to Photos or Gallery</Text>
+      <View style={s.row}>
+        <TouchableOpacity disabled={working || !ready} style={s.button} onPress={() => { setPictureSize(undefined); setReady(false); setFacing(facing === 'back' ? 'front' : 'back'); }}><Text style={s.text}>Flip</Text></TouchableOpacity>
+        <TouchableOpacity disabled={!ready || (working && !recording)} style={s.shutter} onPress={capture} accessibilityLabel={recording ? 'Stop recording' : mode === 'video' ? 'Record video' : 'Take photo'}>
+          <Text style={s.text}>{recording ? 'Stop' : mode === 'video' ? 'Record' : 'Take photo'}</Text>
+        </TouchableOpacity>
+      </View>
+    </>}
+  </View>;
+}
+const s = StyleSheet.create({
+  cover: { ...StyleSheet.absoluteFillObject, backgroundColor: '#000', zIndex: 20 },
+  preview: { flex: 1, width: '100%' },
+  header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingRight: 16 },
+  row: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', paddingBottom: 12 },
+  button: { padding: 18 }, text: { color: '#fff', fontSize: 16 },
+  selected: { color: '#ffd54f', fontWeight: '700' },
+  shutter: { padding: 20, borderWidth: 2, borderColor: '#fff', borderRadius: 40 },
+});

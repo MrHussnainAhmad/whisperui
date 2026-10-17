@@ -1,26 +1,34 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, FlatList,
-  StyleSheet, KeyboardAvoidingView, Platform, Alert,
-  ActivityIndicator, AppState, Keyboard,
+  StyleSheet, Platform, Alert,
+  ActivityIndicator, AppState, Keyboard, Switch, DeviceEventEmitter,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { KeyboardAvoidingView } from 'react-native-keyboard-controller';
 import {
   getSocket, sendMessage, sendImage, sendVideo, sendFile, leaveRoom, reportUser,
   startKeyExchange, isE2EReady, ensureKeypair, resetE2E, configureChatSecurity,
-  verifyChat, canSendMessages, decryptIncoming, sendTyping,
+  confirmSecureChannel, canSendMessages, decryptIncoming, sendTyping,
+  createMessageId, sendReceipt, setMediaSavingAllowed, sendSecurityNotice,
+  getChatEpoch, isChatEpochActive, sendHeartbeat,
 } from '../services/socket';
 import {
   addScreenshotListener,
-  preventScreenCaptureAsync,
-  allowScreenCaptureAsync,
-  enableAppSwitcherProtectionAsync,
-  disableAppSwitcherProtectionAsync,
-  isAvailableAsync,
 } from 'expo-screen-capture';
-import { deriveSharedKey, getSafetyCode } from '../services/e2e';
+import { ensureCaptureProtection, isScreenBeingCaptured, observeCaptureState, isExpoGoFeatureTest } from '../services/captureProtection';
+import { saveReceivedMedia } from '../services/mediaExport';
+import { startPeerLiveness } from '../services/peerLiveness';
+import {
+  deriveSharedKey,
+  getSafetyCode,
+  createKeyConfirmation,
+  verifyKeyConfirmation,
+} from '../services/e2e';
 import ChatBubble from '../components/ChatBubble';
+import AttachmentViewer from '../components/AttachmentViewer';
 import MediaPickerButton from '../components/MediaPickerButton';
+import ChatCamera from '../components/ChatCamera';
 import ScreenContainer from '../components/ScreenContainer';
 import SafetyVerifyOverlay from '../components/SafetyVerifyOverlay';
 import TypingIndicator from '../components/TypingIndicator';
@@ -63,34 +71,95 @@ export default function ChatScreen({ navigation, route }) {
   const inviteCode = route.params?.inviteCode || null;
 
   const [messages, setMessages] = useState([]);
+  const [viewing, setViewing] = useState(null);
   const [text, setText] = useState('');
   const [securing, setSecuring] = useState(true);
   const [verified, setVerified] = useState(false);
   const [safetyCode, setSafetyCode] = useState(null);
   const [peerTyping, setPeerTyping] = useState(false);
   const [keyboardVisible, setKeyboardVisible] = useState(false);
+  const [privacyOverlayVisible, setPrivacyOverlayVisible] = useState(false);
   const [pendingDropped, setPendingDropped] = useState(false);
+  const [allowSaving, setAllowSaving] = useState(false);
+  const [changingPolicy, setChangingPolicy] = useState(false);
+  const [protectionReady, setProtectionReady] = useState(false);
 
   const listRef = useRef(null);
   const lastCountRef = useRef(0);
   const inChatRef = useRef(true);
   const verifiedRef = useRef(false);
   const pendingEncryptedRef = useRef([]);
+  const pendingKeyConfirmationRef = useRef(null);
+  const peerKeyConfirmedRef = useRef(false);
   const authFailureShownRef = useRef(false);
   const typingActiveRef = useRef(false);
   const typingIdleRef = useRef(null);
   const peerTypingIdleRef = useRef(null);
   const backgroundTimerRef = useRef(null);
   const endedRef = useRef(false);
+  const protectionReadyRef = useRef(false);
+  const testNoticeSentRef = useRef(false);
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const cameraResolver = useRef(null);
+  const closeCamera = (asset = null) => {
+    const resolve = cameraResolver.current;
+    cameraResolver.current = null;
+    setCameraOpen(false);
+    resolve?.(asset);
+  };
+  const openCamera = () => new Promise((resolve) => {
+    cameraResolver.current?.(null);
+    cameraResolver.current = resolve;
+    Keyboard.dismiss();
+    setCameraOpen(true);
+  });
+  useEffect(() => () => { cameraResolver.current?.(null); cameraResolver.current = null; }, []);
+  const externalMediaRef = useRef(false);
+  const livenessRef = useRef(null);
 
-  const chatLocked = securing || !verified;
-  const canSend = canSendMessages();
+  const chatLocked = securing || !verified || !protectionReady || privacyOverlayVisible;
+  const canSend = canSendMessages() && !chatLocked;
 
-  const processIncoming = (encrypted) => {
+  const updateDelivery = (messageId, delivery) => {
+    if (!inChatRef.current || endedRef.current) return;
+    setMessages((previous) => previous.map((message) => {
+      if (message.id !== messageId) return message;
+      if (message.delivery === 'delivered') return message;
+      if (delivery === 'relayed' && message.delivery === 'failed') return message;
+      return { ...message, delivery };
+    }));
+  };
+
+  const processIncoming = (payload) => {
+    if (!inChatRef.current || endedRef.current) return;
     try {
-      const msg = decryptIncoming(encrypted);
+      const msg = decryptIncoming(payload?.encrypted, payload?.messageId);
+      if (!msg) return; // More encrypted attachment chunks are still arriving.
+      if (msg.type === 'heartbeat') { sendHeartbeat(msg.challenge, true).catch(() => {}); return; }
+      if (msg.type === 'heartbeat-response') { livenessRef.current?.accept(msg.challenge); return; }
+      if (msg.type === 'session-close') { finishChat('peer_left'); return; }
+      if (msg.type === 'typing') {
+        if (peerTypingIdleRef.current) clearTimeout(peerTypingIdleRef.current);
+        setPeerTyping(msg.active);
+        if (msg.active) peerTypingIdleRef.current = setTimeout(() => setPeerTyping(false), 2500);
+        return;
+      }
+      if (msg.type === 'receipt') {
+        updateDelivery(msg.receiptFor, 'delivered');
+        return;
+      }
+      sendReceipt(msg.messageId).catch(() => {});
+      if (msg.type === 'media-policy' || msg.type === 'security-notice') {
+        const notice = msg.type === 'media-policy'
+          ? (msg.allowSaving ? 'Peer allows saving attachments they send from now on.' : 'Peer disabled saving for new attachments.')
+          : `Peer's device reported ${msg.event === 'screenshot' ? 'a screenshot' : msg.event === 'recording' ? 'screen recording' : 'an overlay'}.`;
+        setMessages((p) => appendBoundedMessage(p, {
+          id: msg.messageId, type: 'system', text: notice, isSent: false, ts: Date.now(),
+        }));
+        return;
+      }
       setMessages((p) => appendBoundedMessage(p, {
-        id: uid(),
+        id: msg.messageId,
         ...msg,
         isSent: false,
         ts: Date.now(),
@@ -110,9 +179,25 @@ export default function ChatScreen({ navigation, route }) {
   };
 
   const unlockChat = async () => {
-    await verifyChat();
+    const epoch = getChatEpoch();
+    await ensureCaptureProtection();
+    if (!inChatRef.current || !isChatEpochActive(epoch)) return;
+    await confirmSecureChannel();
+    if (!inChatRef.current || !isChatEpochActive(epoch)) return;
     verifiedRef.current = true;
     setVerified(true);
+    if (isExpoGoFeatureTest && !testNoticeSentRef.current) {
+      testNoticeSentRef.current = true;
+      sendMessage('Expo Go feature test: this device lacks Whisper native privacy and metadata protections. Please use test content.')
+        .catch(() => { testNoticeSentRef.current = false; });
+    }
+    if (!livenessRef.current) {
+      livenessRef.current = startPeerLiveness({
+        createChallenge: createMessageId,
+        sendChallenge: (challenge) => sendHeartbeat(challenge),
+        onExpired: () => finishChat('peer_unavailable'),
+      });
+    }
     const pending = pendingEncryptedRef.current;
     pendingEncryptedRef.current = [];
     pending.forEach(processIncoming);
@@ -143,22 +228,34 @@ export default function ChatScreen({ navigation, route }) {
   const finishChat = (reasonCode) => {
     if (endedRef.current) return;
     endedRef.current = true;
+    livenessRef.current?.stop();
+    livenessRef.current = null;
     inChatRef.current = false;
+    setPrivacyOverlayVisible(true);
+    setViewing(null);
+    setText('');
+    setVerified(false);
+    setAllowSaving(false);
+    setSafetyCode(null);
     stopOwnTyping();
+    leaveRoom();
     setMessages([]);
     setPeerTyping(false);
     pendingEncryptedRef.current = [];
+    pendingKeyConfirmationRef.current = null;
+    peerKeyConfirmedRef.current = false;
     verifiedRef.current = false;
     if (backgroundTimerRef.current) {
       clearTimeout(backgroundTimerRef.current);
       backgroundTimerRef.current = null;
     }
+    if (peerTypingIdleRef.current) clearTimeout(peerTypingIdleRef.current);
     endChatSession(navigation, reasonCode);
   };
 
   useEffect(() => {
-    configureChatSecurity({ inviteCode, chatMode });
-  }, [inviteCode, chatMode]);
+    configureChatSecurity({ inviteCode, chatMode, roomId });
+  }, [inviteCode, chatMode, roomId]);
 
   useEffect(() => {
     if (!roomId) {
@@ -174,66 +271,90 @@ export default function ChatScreen({ navigation, route }) {
 
     inChatRef.current = true;
     endedRef.current = false;
+    const epoch = getChatEpoch();
+    const stillActive = () => inChatRef.current && !endedRef.current && isChatEpochActive(epoch);
+
+    const failKeyConfirmation = () => {
+      if (!stillActive()) return;
+      Alert.alert('Security Error', 'The peer could not prove possession of the same encryption key.');
+      finishChat('connection_lost');
+    };
+
+    const acceptPeerKeyConfirmation = async (proof) => {
+      if (!stillActive()) return;
+      if (peerKeyConfirmedRef.current) return;
+      if (!verifyKeyConfirmation(proof, roomId)) {
+        failKeyConfirmation();
+        return;
+      }
+      peerKeyConfirmedRef.current = true;
+      const code = await getSafetyCode();
+      if (!stillActive()) return;
+      setSafetyCode(code);
+      if (chatMode === 'random') await unlockChat();
+      setSecuring(false);
+    };
 
     const onPeerKey = async (d) => {
       try {
-        if (isE2EReady()) return;
+        if (d?.protocolVersion !== 6) throw new Error('Unsupported security protocol');
+        await ensureCaptureProtection();
+        if (!stillActive()) return;
         await ensureKeypair();
+        if (!stillActive()) return;
         await deriveSharedKey(d.publicKey);
-        const code = await getSafetyCode();
-        setSafetyCode(code);
-        if (chatMode === 'random') await unlockChat();
-        setSecuring(false);
+        if (!stillActive()) return;
+        socket.emit('key-confirm', { proof: createKeyConfirmation(roomId) });
+        const pendingProof = pendingKeyConfirmationRef.current;
+        pendingKeyConfirmationRef.current = null;
+        if (pendingProof) await acceptPeerKeyConfirmation(pendingProof);
       } catch {
-        Alert.alert('Security Error', 'Could not establish a secure connection.');
-        finishChat('connection_lost');
+        failKeyConfirmation();
+      }
+    };
+
+    const onPeerKeyConfirmation = async (d) => {
+      if (!stillActive()) return;
+      if (typeof d?.proof !== 'string') return;
+      if (!isE2EReady()) {
+        pendingKeyConfirmationRef.current = d.proof;
+        return;
+      }
+      try {
+        await acceptPeerKeyConfirmation(d.proof);
+      } catch {
+        failKeyConfirmation();
       }
     };
 
     const onEncrypted = (d) => {
-      if (typeof d?.encrypted !== 'string') return;
+      if (!stillActive()) return;
+      if (typeof d?.encrypted !== 'string' || typeof d?.messageId !== 'string') return;
       if (!verifiedRef.current) {
-        const queuedChars = pendingEncryptedRef.current.reduce((n, value) => n + value.length, 0);
-        if (pendingEncryptedRef.current.length < 10 && queuedChars + d.encrypted.length <= 5_592_408) {
-          pendingEncryptedRef.current.push(d.encrypted);
+        const queuedChars = pendingEncryptedRef.current
+          .reduce((n, value) => n + value.encrypted.length, 0);
+        if (pendingEncryptedRef.current.length < 64 && queuedChars + d.encrypted.length <= 5_592_408) {
+          pendingEncryptedRef.current.push(d);
         } else {
           setPendingDropped(true);
         }
         return;
       }
-      processIncoming(d.encrypted);
-      setPeerTyping(false);
+      processIncoming(d);
     };
 
     const onEnd = (d) => {
       finishChat(d?.reasonCode || 'peer_left');
     };
 
-    const onSecurityAlert = (d) => {
-      if (d?.source !== 'peer-claim') return;
-      const alertText = d.type === 'screenshot'
-        ? 'Your peer reported a screenshot event. This is a peer claim, not proof that capture was blocked.'
-        : 'Your peer reported a screen-recording event. This is a peer claim, not proof that capture was blocked.';
-      setMessages((p) => appendBoundedMessage(p, {
-        id: uid(), type: 'system', text: alertText, isSent: false, ts: Date.now(),
-      }));
-    };
-
-    const onPeerReady = () => startKeyExchange();
-
-    const onPeerTyping = (d) => {
-      if (peerTypingIdleRef.current) clearTimeout(peerTypingIdleRef.current);
-      if (d?.active !== true) {
-        setPeerTyping(false);
-        return;
-      }
-      setPeerTyping(true);
-      peerTypingIdleRef.current = setTimeout(() => setPeerTyping(false), 2500);
+    const onPeerReady = () => {
+      if (stillActive()) startKeyExchange().catch(failKeyConfirmation);
     };
 
     const onRateLimited = (d) => {
       const labels = {
         'key-exchange': 'security setup',
+        'key-confirm': 'security confirmation',
         'security-alert': 'security alert',
         report: 'report',
         'chat-ready': 'chat ready',
@@ -260,50 +381,67 @@ export default function ChatScreen({ navigation, route }) {
     };
 
     const onDisconnect = () => {
-      if (!inChatRef.current || endedRef.current) return;
+      if (!inChatRef.current || endedRef.current || socket.data?.localClosing) return;
       finishChat('connection_lost');
     };
 
     socket.on('peer-key', onPeerKey);
+    socket.on('peer-key-confirm', onPeerKeyConfirmation);
     socket.on('receive-encrypted', onEncrypted);
     socket.on('chat-ended', onEnd);
-    socket.on('peer-security-alert', onSecurityAlert);
     socket.on('peer-ready', onPeerReady);
-    socket.on('peer-typing', onPeerTyping);
     socket.on('rate-limited', onRateLimited);
     socket.on('error', onSocketError);
     socket.on('disconnect', onDisconnect);
 
-    let captureEnabled = false;
     const setupCaptureProtection = async () => {
       try {
-        const available = await isAvailableAsync();
-        if (available) {
-          await preventScreenCaptureAsync('chat');
-          captureEnabled = true;
-          if (Platform.OS === 'ios') {
-            await enableAppSwitcherProtectionAsync(0.75);
-          }
+        await ensureCaptureProtection();
+        if (!stillActive()) return;
+        if (await isScreenBeingCaptured()) {
+          finishChat('privacy_violation');
+          return;
         }
-      } catch { /* optional platform support */ }
+        if (!stillActive()) return;
+        protectionReadyRef.current = true;
+        setProtectionReady(true);
+        socket.emit('chat-ready');
+        await startKeyExchange();
+      } catch {
+        if (stillActive()) finishChat('protection_unavailable');
+      }
     };
 
     setupCaptureProtection();
 
+    const nativePrivacySub = DeviceEventEmitter.addListener('WhisperPrivacyViolation', () => {
+      if (stillActive()) finishChat('privacy_violation');
+    });
+    const captureStateSub = observeCaptureState(({ captured }) => {
+      if (captured && stillActive()) finishChat('privacy_violation');
+    });
+
     let sub = { remove() {} };
     try {
       sub = addScreenshotListener(() => {
-        if (socket?.connected) socket.emit('security-alert', { type: 'screenshot' });
+        if (!stillActive()) return;
+        setMessages((p) => appendBoundedMessage(p, {
+          id: uid(), type: 'system', text: 'Your device reported a screenshot.', ts: Date.now(),
+        }));
+        sendSecurityNotice('screenshot').catch(() => {});
       });
     } catch { /* optional */ }
 
     const appStateSub = AppState.addEventListener('change', (state) => {
-      if (state === 'background' && inChatRef.current && socket?.connected) {
+      if (!inChatRef.current) return;
+      if (state === 'active' && livenessRef.current && !livenessRef.current.check()) return;
+      setPrivacyOverlayVisible(state !== 'active');
+      if (state === 'background' && inChatRef.current && socket?.connected && !externalMediaRef.current) {
         if (backgroundTimerRef.current) clearTimeout(backgroundTimerRef.current);
         backgroundTimerRef.current = setTimeout(() => {
           if (!inChatRef.current || endedRef.current) return;
           if (AppState.currentState !== 'background' && AppState.currentState !== 'inactive') return;
-          leaveRoom();
+          if (externalMediaRef.current) return;
           finishChat('app_background');
         }, BACKGROUND_LEAVE_GRACE_MS);
         return;
@@ -314,33 +452,34 @@ export default function ChatScreen({ navigation, route }) {
       }
     });
 
-    socket.emit('chat-ready');
-    startKeyExchange();
-
     return () => {
       inChatRef.current = false;
+      livenessRef.current?.stop();
+      livenessRef.current = null;
+      leaveRoom();
       if (backgroundTimerRef.current) {
         clearTimeout(backgroundTimerRef.current);
         backgroundTimerRef.current = null;
       }
       setMessages([]);
       pendingEncryptedRef.current = [];
+      pendingKeyConfirmationRef.current = null;
+      peerKeyConfirmedRef.current = false;
       verifiedRef.current = false;
       socket.off('peer-key', onPeerKey);
+      socket.off('peer-key-confirm', onPeerKeyConfirmation);
       socket.off('receive-encrypted', onEncrypted);
       socket.off('chat-ended', onEnd);
-      socket.off('peer-security-alert', onSecurityAlert);
       socket.off('peer-ready', onPeerReady);
-      socket.off('peer-typing', onPeerTyping);
       socket.off('rate-limited', onRateLimited);
       socket.off('error', onSocketError);
       socket.off('disconnect', onDisconnect);
       stopOwnTyping();
       if (peerTypingIdleRef.current) clearTimeout(peerTypingIdleRef.current);
       sub.remove();
+      nativePrivacySub.remove();
+      captureStateSub.remove();
       appStateSub.remove();
-      if (captureEnabled) allowScreenCaptureAsync('chat').catch(() => {});
-      if (Platform.OS === 'ios') disableAppSwitcherProtectionAsync().catch(() => {});
       resetE2E();
     };
   }, [roomId, navigation, chatMode]);
@@ -374,59 +513,125 @@ export default function ChatScreen({ navigation, route }) {
     }
   };
 
-  const handleLeaveFromVerify = () => {
-    leaveRoom();
-    finishChat('verification_cancelled');
+  const changeSavingPolicy = async (allowed) => {
+    if (!canSend || changingPolicy) return;
+    setChangingPolicy(true);
+    try {
+      await setMediaSavingAllowed(allowed);
+      if (inChatRef.current) setAllowSaving(allowed);
+    } catch {
+      if (inChatRef.current) Alert.alert('Setting not changed', 'The permission could not be sent. Try again.');
+    } finally {
+      if (inChatRef.current) setChangingPolicy(false);
+    }
   };
 
-  const doSend = () => {
-    const t = text.trim();
-    if (!t || !canSend) return;
-    if (!sendMessage(t)) {
-      Alert.alert('Send failed', 'Message could not be sent. Check your connection.');
-      return;
+  const saveMedia = async (message) => {
+    if (!canSend || externalMediaRef.current || message.isSent || message.allowSaving !== true) return;
+    const epoch = getChatEpoch();
+    externalMediaRef.current = true;
+    if (backgroundTimerRef.current) clearTimeout(backgroundTimerRef.current);
+    try {
+      const saved = await saveReceivedMedia(message, () => inChatRef.current && isChatEpochActive(epoch));
+      if (saved && inChatRef.current && Platform.OS === 'android') Alert.alert('Saved', 'The attachment was saved to your selected folder.');
+    } catch {
+      if (inChatRef.current) Alert.alert('Unable to save', 'The export was cancelled or could not finish.');
+    } finally {
+      externalMediaRef.current = false;
+      if (inChatRef.current && AppState.currentState !== 'active') {
+        if (backgroundTimerRef.current) clearTimeout(backgroundTimerRef.current);
+        backgroundTimerRef.current = setTimeout(() => {
+          if (inChatRef.current && !externalMediaRef.current && AppState.currentState !== 'active') finishChat('app_background');
+        }, BACKGROUND_LEAVE_GRACE_MS);
+      }
     }
+  };
+
+  const handleLeaveFromVerify = () => {
+    Alert.alert('Leave chat?', 'This clears the conversation from this app. Exported copies cannot be recalled.', [
+      { text: 'Stay', style: 'cancel' },
+      {
+        text: 'Leave',
+        style: 'destructive',
+        onPress: () => {
+          leaveRoom();
+          finishChat('verification_cancelled');
+        },
+      },
+    ]);
+  };
+
+  const doSend = async () => {
+    const t = text.trim();
+    if (!t || !canSend || endedRef.current) return;
+    const messageId = createMessageId();
     stopOwnTyping();
     setMessages((p) => appendBoundedMessage(p, {
-      id: uid(), type: 'text', text: t, isSent: true, ts: Date.now(),
+      id: messageId, type: 'text', text: t, isSent: true, ts: Date.now(), delivery: 'sending',
     }));
     setText('');
-  };
-
-  const doImg = (payload) => {
-    if (!canSend) return;
-    if (!sendImage(payload.imageData, payload.mimeType)) {
-      Alert.alert('Unsupported image', 'This image type or size cannot be sent safely.');
-      return;
+    try {
+      await sendMessage(t, messageId);
+      updateDelivery(messageId, 'relayed');
+    } catch {
+      updateDelivery(messageId, 'failed');
+      Alert.alert('Send failed', 'Message could not be relayed. Check your connection.');
     }
-    setMessages((p) => appendBoundedMessage(p, {
-      id: uid(), type: 'image', ...payload, isSent: true, ts: Date.now(),
-    }));
   };
 
-  const doVid = (payload) => {
-    if (!canSend) return;
-    if (!sendVideo(payload.videoData, payload.mimeType)) {
-      Alert.alert('Unsupported video', 'This video type or size cannot be sent safely.');
-      return;
+  const updateProgress = (messageId) => (progress) => {
+    if (!inChatRef.current || endedRef.current) return;
+    setMessages((previous) => previous.map((message) => message.id === messageId ? { ...message, progress } : message));
+  };
+
+  const doImg = async (payload) => {
+    if (!canSendMessages() || endedRef.current || !protectionReadyRef.current) return;
+    const messageId = createMessageId();
+    setMessages((p) => appendBoundedMessage(p, {
+      id: messageId, type: 'image', ...payload, isSent: true, ts: Date.now(), delivery: 'sending',
+    }));
+    try {
+      await sendImage(payload.fileUri ? payload : payload.imageData, payload.mimeType, messageId, updateProgress(messageId));
+      updateDelivery(messageId, 'relayed');
+    } catch {
+      updateDelivery(messageId, 'failed');
+      Alert.alert('Send failed', 'This image could not be relayed safely.');
     }
-    setMessages((p) => appendBoundedMessage(p, {
-      id: uid(), type: 'video', ...payload, isSent: true, ts: Date.now(),
-    }));
   };
 
-  const doFile = (payload) => {
-    if (!canSend) return;
-    if (!sendFile(payload.fileData, payload.mimeType, payload.fileName, payload.fileSize)) {
-      Alert.alert('Unsupported file', 'This file metadata or size cannot be sent safely.');
-      return;
+  const doVid = async (payload) => {
+    if (!canSendMessages() || endedRef.current || !protectionReadyRef.current) return;
+    const messageId = createMessageId();
+    setMessages((p) => appendBoundedMessage(p, {
+      id: messageId, type: 'video', ...payload, isSent: true, ts: Date.now(), delivery: 'sending',
+    }));
+    try {
+      await sendVideo(payload.fileUri ? payload : payload.videoData, payload.mimeType, messageId, updateProgress(messageId));
+      updateDelivery(messageId, 'relayed');
+    } catch {
+      updateDelivery(messageId, 'failed');
+      Alert.alert('Send failed', 'This video could not be relayed safely.');
     }
-    setMessages((p) => appendBoundedMessage(p, {
-      id: uid(), type: 'file', ...payload, isSent: true, ts: Date.now(),
-    }));
   };
 
-  const confirmLeave = () => Alert.alert('Leave chat?', 'This conversation will be gone forever.', [
+  const doFile = async (payload) => {
+    if (!canSendMessages() || endedRef.current || !protectionReadyRef.current) return;
+    const messageId = createMessageId();
+    setMessages((p) => appendBoundedMessage(p, {
+      id: messageId, type: 'file', ...payload, isSent: true, ts: Date.now(), delivery: 'sending',
+    }));
+    try {
+      await sendFile(
+        payload.fileUri ? payload : payload.fileData, payload.mimeType, payload.fileName, payload.fileSize, messageId, updateProgress(messageId)
+      );
+      updateDelivery(messageId, 'relayed');
+    } catch {
+      updateDelivery(messageId, 'failed');
+      Alert.alert('Send failed', 'This file could not be relayed safely.');
+    }
+  };
+
+  const confirmLeave = () => Alert.alert('Leave chat?', 'This clears the conversation from this app. Exported copies cannot be recalled.', [
     { text: 'Stay', style: 'cancel' },
     {
       text: 'Leave',
@@ -462,8 +667,10 @@ export default function ChatScreen({ navigation, route }) {
       <ScreenContainer variant="chat">
         <KeyboardAvoidingView
           style={styles.flex}
-          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-          keyboardVerticalOffset={0}
+          behavior="padding"
+          // Offset is distance from screen top to this view (SafeAreaView top inset),
+          // not the bottom nav inset — using bottom under-lifts on gesture-nav devices.
+          keyboardVerticalOffset={insets.top}
           enabled
         >
           <View style={[
@@ -507,8 +714,8 @@ export default function ChatScreen({ navigation, route }) {
                   isTablet && { fontSize: 12 },
                 ]}>
                   {chatMode === 'invite'
-                    ? `Invite-authenticated · ${safetyCode}`
-                    : 'Relay-trusted · peer unverified'}
+                    ? `Verified by invite code - ${safetyCode}`
+                    : 'Encrypted - peer unverified'}
                 </Text>
               )}
             </View>
@@ -524,6 +731,22 @@ export default function ChatScreen({ navigation, route }) {
             </View>
           </View>
 
+          {isExpoGoFeatureTest && <View accessibilityRole="alert" style={[styles.notice, { backgroundColor: colors.warningTint }]}>
+            <Text style={[typography.caption, { color: colors.text }]}>Expo Go feature test</Text>
+            <Text style={[typography.micro, { color: colors.textSecondary }]}>Encryption and chat features are active. Native recording detection, privacy covers and metadata tools require an installed build. Use test content.</Text>
+          </View>}
+
+          <View style={[styles.savingRow, { borderBottomColor: colors.separator }]}>
+            <View style={styles.flex}>
+              <Text style={[typography.caption, { color: colors.text }]}>Allow saving my media</Text>
+              <Text style={[typography.micro, { color: colors.textSecondary }]}>
+                {isExpoGoFeatureTest ? 'Applies to new attachments. Native privacy checks are unavailable in this test.' : 'Applies to new attachments. Screen protection stays on.'}
+              </Text>
+            </View>
+            <Switch value={allowSaving} onValueChange={changeSavingPolicy}
+              disabled={!canSend || changingPolicy} accessibilityLabel="Allow peer to save my new attachments" />
+          </View>
+
           {pendingDropped && !verified && (
             <View style={[styles.notice, { backgroundColor: colors.warningTint }]}>
               <Text style={[typography.caption, { color: colors.warning, textAlign: 'center' }]}>
@@ -534,14 +757,15 @@ export default function ChatScreen({ navigation, route }) {
 
           <FlatList
             ref={listRef}
-            data={messages}
-            renderItem={({ item }) => <ChatBubble message={item} isSent={item.isSent} />}
+            data={privacyOverlayVisible || !protectionReady ? [] : messages}
+            renderItem={({ item }) => <ChatBubble message={item} isSent={item.isSent}
+              onSave={saveMedia} onOpen={setViewing} mediaActive={!chatLocked && !viewing && inChatRef.current} />}
             keyExtractor={(i) => i.id}
             style={styles.list}
             contentContainerStyle={[styles.listContent, { paddingHorizontal: horizontalPadding }]}
             keyboardDismissMode="on-drag"
             keyboardShouldPersistTaps="handled"
-            automaticallyAdjustKeyboardInsets={Platform.OS === 'ios'}
+            automaticallyAdjustKeyboardInsets={false}
             onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: false })}
             onLayout={() => listRef.current?.scrollToEnd({ animated: false })}
           />
@@ -563,6 +787,8 @@ export default function ChatScreen({ navigation, route }) {
             },
           ]}>
             <MediaPickerButton
+              onOpenCamera={openCamera}
+              onProcessingChange={(active) => { externalMediaRef.current = active; }}
               onImageSelected={doImg}
               onVideoSelected={doVid}
               onFileSelected={doFile}
@@ -584,6 +810,7 @@ export default function ChatScreen({ navigation, route }) {
               placeholderTextColor={colors.textTertiary}
               value={text}
               onChangeText={handleTextChange}
+              onFocus={() => setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 120)}
               multiline
               scrollEnabled
               textAlignVertical="center"
@@ -609,6 +836,8 @@ export default function ChatScreen({ navigation, route }) {
         </KeyboardAvoidingView>
       </ScreenContainer>
 
+      {viewing && !chatLocked && inChatRef.current && <AttachmentViewer
+        message={viewing} onClose={() => setViewing(null)} onSave={saveMedia} />}
       {securing && (
         <View style={[styles.securingOverlay, { backgroundColor: isDark ? 'rgba(0,0,0,0.85)' : 'rgba(242,242,247,0.92)' }]}>
           <ActivityIndicator size="large" color={colors.accent} />
@@ -628,11 +857,21 @@ export default function ChatScreen({ navigation, route }) {
           onLeave={handleLeaveFromVerify}
         />
       )}
+
+      {cameraOpen && <ChatCamera onDone={closeCamera} />}
+
+      {privacyOverlayVisible && (
+        <View pointerEvents="auto" style={[styles.privacyOverlay, { backgroundColor: colors.surface }]}>
+          <Text style={[typography.caption, { color: colors.textTertiary }]}>Content hidden for privacy</Text>
+        </View>
+      )}
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
+  savingRow: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 16,
+    paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth },
   safe: { flex: 1 },
   flex: { flex: 1 },
   typingRow: { minHeight: 28, justifyContent: 'center' },
@@ -663,6 +902,12 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     zIndex: 10,
+  },
+  privacyOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 30,
   },
   list: { flex: 1 },
   listContent: { flexGrow: 1, justifyContent: 'flex-end', paddingVertical: sp.sm },

@@ -1,9 +1,11 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { View, Text, Animated, StyleSheet, Easing } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import StatusBar from '../components/StatusBar';
 import Button from '../components/Button';
-import { getSocket, cancelSearch } from '../services/socket';
+import {
+  getSocket, cancelSearch, findRandom, RECONNECT_WINDOW_MS,
+} from '../services/socket';
 import { sp } from '../theme';
 import { useTheme } from '../hooks/useTheme';
 import ScreenContainer from '../components/ScreenContainer';
@@ -13,6 +15,8 @@ export default function WaitingScreen({ navigation }) {
   const { colors, typography } = useTheme();
   const { isTablet, horizontalPadding } = useResponsiveLayout();
   const pulse = useRef(new Animated.Value(0)).current;
+  const reconnectTimerRef = useRef(null);
+  const [reconnecting, setReconnecting] = useState(false);
 
   useEffect(() => {
     // Smooth ease-in-out pulse for the search ring (1 -> 1.6 -> 1).
@@ -27,12 +31,44 @@ export default function WaitingScreen({ navigation }) {
     const socket = getSocket();
     if (!socket) { navigation.replace('Home'); return; }
 
-    const onMatched = (d) => navigation.replace('Chat', { roomId: d.roomId, chatMode: 'random' });
+    let matched = false;
+    const onMatched = (d) => {
+      if (matched || !d?.roomId) return;
+      matched = true;
+      navigation.replace('Chat', { roomId: d.roomId, chatMode: 'random' });
+    };
     const onErr = () => navigation.replace('Home');
+    const onDisconnect = () => {
+      setReconnecting(true);
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = setTimeout(() => {
+        if (!socket.connected || !socket.data?.sessionReady) navigation.replace('Home');
+      }, RECONNECT_WINDOW_MS + 50);
+    };
+    const onJoined = async () => {
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+      setReconnecting(false);
+      try {
+        await findRandom();
+      } catch {
+        navigation.replace('Home');
+      }
+    };
     socket.on('matched', onMatched);
     socket.on('error', onErr);
+    socket.on('disconnect', onDisconnect);
+    socket.on('joined', onJoined);
+    if (socket.data?.pendingMatch) onMatched(socket.data.pendingMatch);
 
-    return () => { anim.stop(); socket.off('matched', onMatched); socket.off('error', onErr); };
+    return () => {
+      anim.stop();
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      socket.off('matched', onMatched);
+      socket.off('error', onErr);
+      socket.off('disconnect', onDisconnect);
+      socket.off('joined', onJoined);
+    };
   }, []);
 
   // ringScale goes 1.0 -> 1.6, opacity 0.35 -> 0
@@ -54,7 +90,9 @@ export default function WaitingScreen({ navigation }) {
             />
             <View style={[s.dot, { backgroundColor: colors.accent }, isTablet && s.dotTablet]} />
           </View>
-          <Text style={[typography.title, { color: colors.text, marginBottom: sp.xs }]}>Searching</Text>
+          <Text style={[typography.title, { color: colors.text, marginBottom: sp.xs }]}>
+            {reconnecting ? 'Reconnecting' : 'Searching'}
+          </Text>
           <Text style={[typography.body, { color: colors.textSecondary }]}>Looking for someone online…</Text>
         </View>
         <View style={{ paddingHorizontal: horizontalPadding, marginBottom: sp.xl }}>

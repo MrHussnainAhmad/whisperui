@@ -7,5 +7,5 @@ import { useTheme } from '../hooks/useTheme';
  */
 export default function StatusBar() {
   const { isDark } = useTheme();
-  return <RNStatusBar style={isDark ? 'light' : 'dark'} />;
+  return <RNStatusBar style={isDark ? 'light' : 'dark'} translucent backgroundColor="transparent" />;
 }

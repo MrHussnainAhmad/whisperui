@@ -1,11 +1,35 @@
-module.exports = ({ config }) => {
-  const profile = process.env.EAS_BUILD_PROFILE || '';
-  const productionLike = process.env.NODE_ENV === 'production' || (profile !== '' && profile !== 'development');
-  const cleartextRequested = process.env.ALLOW_CLEARTEXT_DEV === 'true';
-  if (productionLike && cleartextRequested) {
-    throw new Error('ALLOW_CLEARTEXT_DEV can only be enabled for a development build');
+const { withMainActivity } = require('expo/config-plugins');
+
+const TABLET_ORIENTATION_MARKER = '// Keep the tablet UI in landscape while phones remain unrestricted.';
+const DEPLOYED_SERVER_URL = process.env.EXPO_PUBLIC_SERVER_URL || 'https://mywhisperchat.duckdns.org';
+
+const withTabletLandscape = (config) => withMainActivity(config, (modConfig) => {
+  if (modConfig.modResults.language !== 'kt') return modConfig;
+
+  let { contents } = modConfig.modResults;
+  if (!contents.includes('import android.content.pm.ActivityInfo')) {
+    contents = contents.replace(
+      'import android.os.Build\n',
+      'import android.content.pm.ActivityInfo\nimport android.content.res.Configuration\nimport android.os.Build\n',
+    );
   }
-  const allowCleartextDev = cleartextRequested && !productionLike;
+
+  if (!contents.includes(TABLET_ORIENTATION_MARKER)) {
+    contents = contents.replace(
+      '    setTheme(R.style.AppTheme);\n    super.onCreate(null)',
+      `    setTheme(R.style.AppTheme);\n    ${TABLET_ORIENTATION_MARKER}\n    if (isTablet()) requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE\n    super.onCreate(null)`,
+    );
+    contents = contents.replace(
+      '\n  /**\n   * Returns the name of the main component registered from JavaScript.',
+      `\n  private fun isTablet(): Boolean {\n    val size = resources.configuration.screenLayout and Configuration.SCREENLAYOUT_SIZE_MASK\n    return size >= Configuration.SCREENLAYOUT_SIZE_LARGE\n  }\n\n  /**\n   * Returns the name of the main component registered from JavaScript.`,
+    );
+  }
+
+  modConfig.modResults.contents = contents;
+  return modConfig;
+});
+
+module.exports = ({ config }) => {
   const buildPropertyPlugins = (config.plugins || []).filter((plugin) =>
     Array.isArray(plugin) && plugin[0] === 'expo-build-properties'
   );
@@ -23,25 +47,30 @@ module.exports = ({ config }) => {
       ...options,
       android: {
         ...(options.android || {}),
-        usesCleartextTraffic: allowCleartextDev,
+        usesCleartextTraffic: false,
       },
     }];
   });
+  plugins.push(withTabletLandscape);
+  plugins.push(require('./plugins/withPrivacyWindow'));
 
   return {
     ...config,
     plugins,
+    extra: {
+      ...(config.extra || {}),
+      serverUrl: DEPLOYED_SERVER_URL,
+    },
     ios: {
       ...(config.ios || {}),
       infoPlist: {
         ...(config.ios?.infoPlist || {}),
+        'UISupportedInterfaceOrientations~ipad': [
+          'UIInterfaceOrientationLandscapeLeft',
+          'UIInterfaceOrientationLandscapeRight',
+        ],
         NSAppTransportSecurity: {
           NSAllowsArbitraryLoads: false,
-          ...(!productionLike ? {
-            NSExceptionDomains: {
-              localhost: { NSExceptionAllowsInsecureHTTPLoads: true },
-            },
-          } : {}),
         },
       },
     },

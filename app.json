@@ -1,16 +1,11 @@
 {
   "expo": {
     "name": "Whisper",
-    "slug": "whisper",
+    "slug": "whsiperapp",
     "icon": "./assets/icon.png",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "orientation": "default",
     "userInterfaceStyle": "automatic",
-    "splash": {
-      "image": "./assets/splash.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#0B0F14"
-    },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.hussnainahmadsahi.chat"
@@ -18,8 +13,17 @@
     "android": {
       "package": "com.hussnainahmadsahi.chat",
       "allowBackup": false,
+      "softwareKeyboardLayoutMode": "resize",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.INTERNET",
+        "android.permission.VIBRATE"
+      ],
       "blockedPermissions": [
-        "android.permission.RECORD_AUDIO"
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
       ],
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
@@ -37,32 +41,41 @@
         }
       ],
       [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash.png",
+          "resizeMode": "contain",
+          "backgroundColor": "#0B0F14",
+          "imageWidth": 200
+        }
+      ],
+      [
         "expo-image-picker",
         {
           "photosPermission": "Allow access to select photos to share in chat.",
-          "cameraPermission": "Allow access to camera to take photos for chat."
+          "cameraPermission": "Allow access to camera to take photos for chat.",
+          "microphonePermission": "Allow Whisper to record audio when you record a video."
         }
       ],
       [
         "expo-camera",
         {
           "cameraPermission": "Allow camera access to scan a Whisper invite QR code.",
-          "microphonePermission": false,
-          "recordAudioAndroid": false
+          "microphonePermission": "Allow Whisper to record audio when you record a video.",
+          "recordAudioAndroid": true
         }
       ],
-      [
-        "expo-av",
-        {
-          "microphonePermission": false
-        }
-      ]
+      "expo-sharing",
+      "expo-status-bar",
+      "expo-font"
     ],
     "extra": {
+      "serverUrl": "https://mywhisperchat.duckdns.org",
       "eas": {
-        "projectId": "034c9b6f-c804-42e3-bc79-ced05105e270"
+        "projectId": "b5273018-113e-442c-aa2e-5699a1d7f842"
       }
     },
-    "owner": "hussnainahmadsahi"
+    "owner": "accformes-team",
+    "scheme": "whisperchat"
   }
 }

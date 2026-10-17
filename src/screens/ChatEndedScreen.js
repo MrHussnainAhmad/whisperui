@@ -15,6 +15,9 @@ export default function ChatEndedScreen({ navigation, route }) {
   const { isTablet } = useResponsiveLayout();
 
   const reasons = {
+    protection_unavailable: 'Required screen protection could not be enabled.',
+    peer_unavailable: 'The other device stopped confirming this session. The chat was closed.',
+    privacy_violation: 'The session ended because a privacy protection was interrupted.',
     peer_left: 'The other person left.',
     session_expired: 'The session reached its privacy time limit.',
     reported: 'Chat ended due to a report.',
@@ -50,7 +53,8 @@ export default function ChatEndedScreen({ navigation, route }) {
             <Icon name="checkmark" size={isTablet ? 34 : 28} color={colors.accent} />
           </View>
           <Text style={[typography.title, { color: colors.text, marginBottom: sp.xs }]}>Chat ended</Text>
-          <Text style={[typography.body, { color: colors.textSecondary }]}>This conversation is gone.</Text>
+          <Text style={[typography.body, { color: colors.textSecondary }]}>The conversation has been cleared from this app.</Text>
+          <Text style={[typography.caption, { color: colors.textTertiary, marginTop: sp.sm }]}>Copies already exported cannot be recalled.</Text>
           <Text style={[typography.caption, { color: colors.textTertiary, fontStyle: 'italic', marginTop: sp.sm, textAlign: 'center' }]}>
             {reason}
           </Text>
